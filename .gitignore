@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.venv/
+__pycache__/
+.pytest_cache/
+*.db
+*.db-*
+.env
+*.tsbuildinfo
+
+# Local machine files and private environment overrides
+.DS_Store
+.env.*
+!.env.example
+*.log
