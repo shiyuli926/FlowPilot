@@ -113,6 +113,21 @@ def create_project(project: Project):
     with lock,Session.begin() as db:
         project.id=uid(); db.add(ProjectRow(id=project.id,data=project.model_dump(mode='json'))); bump(db,db.get(StateRow,1)); return project
 
+@app.delete('/api/projects/{project_id}')
+def delete_project(project_id: str):
+    """Remove the category while keeping its tasks and published schedule intact."""
+    with lock,Session.begin() as db:
+        project=db.get(ProjectRow,project_id)
+        if not project: fail('项目不存在',404)
+        moved=0
+        for task in db.scalars(select(TaskRow)).all():
+            if task.data.get('project_id') == project_id:
+                task.data={**task.data,'project_id':None}
+                moved+=1
+        db.delete(project)
+        bump(db,db.get(StateRow,1))
+        return {'ok':True,'unclassified_tasks':moved}
+
 @app.get('/api/calendar/events')
 def get_events():
     with Session() as db: return rows(db,EventRow,Event)
