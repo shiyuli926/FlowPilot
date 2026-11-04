@@ -13,3 +13,6 @@ __pycache__/
 .env.*
 !.env.example
 *.log
+
+# Screenshot of the personal workspace; keep local.
+docs/screenshots/fixed-event-calendar.jpg

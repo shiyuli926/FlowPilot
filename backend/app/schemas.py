@@ -1,4 +1,4 @@
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, Field, model_validator, field_validator, ConfigDict
@@ -42,6 +42,36 @@ class Task(StrictModel):
         if self.status == 'done': self.remaining_minutes = 0
         return self
 
+class Recurrence(StrictModel):
+    frequency: Literal['daily', 'weekly']
+    interval: int = Field(default=1, ge=1, le=12)
+    weekdays: list[int] = Field(default_factory=list, max_length=7)
+    until: date | None = None
+    timezone: str = 'Asia/Shanghai'
+
+    @model_validator(mode='after')
+    def valid(self):
+        try: ZoneInfo(self.timezone)
+        except ZoneInfoNotFoundError: raise ValueError('重复规则需要有效 IANA 时区')
+        if any(d < 0 or d > 6 for d in self.weekdays): raise ValueError('星期必须在0至6之间')
+        self.weekdays=sorted(set(self.weekdays))
+        if self.frequency=='daily' and self.weekdays: raise ValueError('每天重复无需指定星期')
+        return self
+
+class EventException(StrictModel):
+    cancelled: bool = False
+    title: str | None = Field(default=None, min_length=1, max_length=240)
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+
+    @model_validator(mode='after')
+    def valid(self):
+        if not self.cancelled:
+            if not self.start_at or not self.end_at: raise ValueError('修改单次日程需要起止时间')
+            if not self.start_at.tzinfo or not self.end_at.tzinfo: raise ValueError('日程时间需要时区')
+            if self.end_at <= self.start_at: raise ValueError('结束必须晚于开始')
+        return self
+
 class Event(StrictModel):
     id: str = ''
     title: str = Field(min_length=1, max_length=240)
@@ -49,12 +79,27 @@ class Event(StrictModel):
     end_at: datetime
     color: str = '#b98960'
     source: str = 'manual'
+    recurrence: Recurrence | None = None
+    exceptions: dict[str, EventException] = Field(default_factory=dict)
 
     @model_validator(mode='after')
     def valid(self):
         if not self.start_at.tzinfo or not self.end_at.tzinfo: raise ValueError('日程时间需要时区')
         if self.end_at <= self.start_at: raise ValueError('结束必须晚于开始')
+        if self.recurrence:
+            zone=ZoneInfo(self.recurrence.timezone)
+            wall_start=self.start_at.astimezone(zone).replace(tzinfo=None)
+            wall_duration=self.end_at.astimezone(zone).replace(tzinfo=None)-wall_start
+            if not timedelta(0)<wall_duration<=timedelta(days=7): raise ValueError('重复日程的当地起止时间需为正且不超过7天')
+            start=wall_start.date()
+            if self.recurrence.until and self.recurrence.until < start: raise ValueError('重复截止日期不能早于首次日期')
+        elif self.exceptions: raise ValueError('单次日程不能设置重复例外')
+        for key in self.exceptions: date.fromisoformat(key)
         return self
+
+class EventOccurrence(Event):
+    series_id: str | None = None
+    occurrence_date: date | None = None
 
 class Project(StrictModel):
     id: str = ''
@@ -95,6 +140,24 @@ class Block(StrictModel):
 class ParseRequest(StrictModel):
     text: str = Field(min_length=1, max_length=10000)
     now: datetime | None = None
+
+class EventDraft(StrictModel):
+    title: str = Field(min_length=1, max_length=240)
+    start_at: datetime | None = None
+    end_at: datetime | None = None
+    recurrence: Recurrence | None = None
+
+    @model_validator(mode='after')
+    def valid(self):
+        for value in (self.start_at, self.end_at):
+            if value and value.tzinfo is None: raise ValueError('日程时间需要时区')
+        if self.start_at and self.end_at and self.end_at <= self.start_at:
+            raise ValueError('结束必须晚于开始')
+        return self
+
+class AIConfirmation(StrictModel):
+    tasks: list[Task] = Field(default_factory=list, max_length=30)
+    events: list[Event] = Field(default_factory=list, max_length=30)
 
 class PreviewRequest(StrictModel):
     now: datetime | None = None

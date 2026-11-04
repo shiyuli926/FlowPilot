@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from uuid import uuid4
 from app.schemas import Task, Event, Block, Settings
+from app.recurrence import expand_events
 
 UTC = timezone.utc
 STEP = timedelta(minutes=15)
@@ -41,6 +42,9 @@ def validate_dependencies(tasks):
     for t in tasks: visit(t)
 
 def validate_blocks(blocks, tasks, events, settings, now, allow_existing_past=True):
+    start=min([now]+[b.start_at for b in blocks])
+    end=max([now+timedelta(days=settings.horizon_days)]+[b.end_at for b in blocks])
+    events=expand_events(events,start,end)
     by_id = {t.id: t for t in tasks}
     available = set(slots_for(settings, now))
     totals = {}
@@ -75,6 +79,7 @@ def validate_blocks(blocks, tasks, events, settings, now, allow_existing_past=Tr
 
 
 def schedule(tasks: list[Task], events: list[Event], previous: list[Block], settings: Settings, now: datetime):
+    events=expand_events(events,min([now]+[b.start_at for b in previous]),max([now+timedelta(days=settings.horizon_days)]+[b.end_at for b in previous]))
     validate_dependencies(tasks)
     all_slots = slots_for(settings, now)
     slot_set = set(all_slots)

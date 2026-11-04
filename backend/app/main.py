@@ -3,13 +3,15 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 from sqlalchemy import select
 from app.core.db import Session, init_db, StateRow, TaskRow, EventRow, ProjectRow, RunRow
-from app.schemas import Task, Event, Project, Settings, Block, ParseRequest, PreviewRequest, CommitRequest, MoveBlock
+from app.schemas import Task, Event, Project, Settings, Block, ParseRequest, PreviewRequest, CommitRequest, MoveBlock, AIConfirmation, EventException
+from app.recurrence import expand_events, occurs_on, validation_windows
 from app.scheduler.engine import schedule, analyze_risks, validate_dependencies, validate_blocks
 from app.ai.parser import parse
 
@@ -132,14 +134,65 @@ def delete_project(project_id: str):
 def get_events():
     with Session() as db: return rows(db,EventRow,Event)
 
+@app.get('/api/calendar/occurrences')
+def get_occurrences(start: datetime, end: datetime):
+    if not start.tzinfo or not end.tzinfo or not timedelta(0)<end-start<=timedelta(days=366):
+        fail('日历查询需带时区，范围不超过366天')
+    with Session() as db: return expand_events(rows(db,EventRow,Event),start,end)
+
+def validate_event_changes(db, candidates, exclude_id=None):
+    state=db.get(StateRow,1)
+    existing=[e for e in rows(db,EventRow,Event) if e.id!=exclude_id]
+    protected=[b for b in current_blocks(db,state.data) if (b.is_locked or b.start_at<=now()<b.end_at) and b.end_at>now()]
+    for start,end in validation_windows(existing+candidates,protected,now()):
+        old=expand_events(existing,start,end); new=expand_events(candidates,start,end)
+        intervals=sorted([(e.start_at,e.end_at,'old') for e in old]+[(e.start_at,e.end_at,'new') for e in new]+
+                         [(b.start_at,b.end_at,'locked') for b in protected])
+        active=[]
+        for begin,finish,kind in intervals:
+            active=[entry for entry in active if entry[0]>begin]
+            for _,previous_kind in active:
+                if kind!='new' and previous_kind!='new': continue
+                if 'locked' in (kind,previous_kind): fail('新日程与锁定或正在执行的时间块冲突，请调整日程时间或先解锁')
+                fail('新日程与已有或本批固定日程冲突，请调整时间')
+            active.append((finish,kind))
+
 @app.post('/api/calendar/events')
 def create_event(event: Event):
     with lock,Session.begin() as db:
         event.id=uid(); state=db.get(StateRow,1)
-        from app.scheduler.engine import overlap
-        if any((b.is_locked or b.start_at<=now()<b.end_at) and b.end_at>now() and overlap(b.start_at,b.end_at,event.start_at,event.end_at) for b in current_blocks(db,state.data)):
-            fail('新事件与锁定或正在执行的时间块冲突，请先解锁或调整时间')
+        if event.exceptions: fail('创建日程不能提供单次例外')
+        validate_event_changes(db,[event])
         db.add(EventRow(id=event.id,data=event.model_dump(mode='json'))); bump(db,state); return event
+
+@app.put('/api/calendar/events/{event_id}')
+def update_event(event_id: str, event: Event):
+    with lock,Session.begin() as db:
+        row=db.get(EventRow,event_id)
+        if not row: fail('日程不存在',404)
+        old=Event.model_validate(row.data)
+        event.id=event_id; event.source=old.source
+        # Existing cancellations/overrides survive series edits. Changing the
+        # first date or frequency explicitly starts a new pattern and clears them.
+        same_pattern=bool(old.recurrence and event.recurrence and
+            old.recurrence.model_dump(exclude={'until'})==event.recurrence.model_dump(exclude={'until'}) and
+            old.start_at.astimezone(ZoneInfo(old.recurrence.timezone)).date()==event.start_at.astimezone(ZoneInfo(event.recurrence.timezone)).date())
+        event.exceptions=old.exceptions if same_pattern and event.recurrence else {}
+        validate_event_changes(db,[event],exclude_id=event_id)
+        row.data=event.model_dump(mode='json'); bump(db,db.get(StateRow,1)); return event
+
+@app.put('/api/calendar/events/{event_id}/occurrences/{day}')
+def update_occurrence(event_id: str, day: str, change: EventException):
+    with lock,Session.begin() as db:
+        row=db.get(EventRow,event_id)
+        if not row: fail('日程不存在',404)
+        event=Event.model_validate(row.data)
+        try: original=datetime.fromisoformat(day).date()
+        except ValueError: fail('无效的单次日期')
+        if original.isoformat()!=day or not event.recurrence or not occurs_on(event,original): fail('该日期不是此组的重复日程')
+        event.exceptions={**event.exceptions,day:change}
+        validate_event_changes(db,[event],exclude_id=event_id)
+        row.data=event.model_dump(mode='json'); bump(db,db.get(StateRow,1)); return event
 
 @app.delete('/api/calendar/events/{event_id}')
 def delete_event(event_id: str):
@@ -240,10 +293,38 @@ def history():
 
 @app.post('/api/ai/chat')
 async def chat(request: ParseRequest):
-    if any(w in request.text for w in ['能完成','风险','来得及']):
+    if any(w in request.text for w in ['能完成','来得及','分析我的截止风险']) or request.text.strip() in ['风险','截止风险','分析风险']:
         risks=get_risks(); bad=[r for r in risks if r['missing_before_deadline']]
         return {'type':'analysis','message':f'根据当前已发布计划，{len(bad)} 个任务有未安排工作量，共 {sum(r["missing_before_deadline"] for r in bad)} 分钟。风险是当前方案的结果，不代表全局不可行证明。可先重新规划，再增加可用时间或调整任务范围。','risks':risks}
-    return {'type':'task_preview','message':'我已提取任务建议，请确认后保存。调整可用时间请前往设置；对话不会直接移动或删除任务。','preview':await parse_tasks(request)}
+    import re
+    if re.search(r'每月|每年|每个月|每个季度|每季度',request.text):
+        return {'type':'clarification','message':'目前支持每天、工作日和每周指定星期的重复固定日程。按月、按年重复请先改为每天或每周规则。'}
+    with Session() as db: tz=db.get(StateRow,1).data['settings']['timezone']
+    clock=request.now or now()
+    if not clock.tzinfo: fail('输入时间必须包含时区')
+    preview=await parse(request.text,clock,tz,include_events=True)
+    event_count=len(preview.get('events',[])); task_count=len(preview['items'])
+    label='、'.join(([f'{task_count} 个任务'] if task_count else [])+([f'{event_count} 个固定日程'] if event_count else []))
+    return {'type':'plan_preview','message':f'已提取 {label}，请检查并补全时间，确认后保存。固定日程会占用日历时间。','preview':preview}
+
+@app.post('/api/ai/confirm')
+def confirm_ai(request: AIConfirmation):
+    if not 1 <= len(request.tasks)+len(request.events) <= 30: fail('每批需包含1至30个任务或日程')
+    with lock,Session.begin() as db:
+        state=db.get(StateRow,1); tasks,events,_=data_sets(db)
+        for task in request.tasks:
+            task.id=uid()
+            if task.project_id and not db.get(ProjectRow,task.project_id): fail('项目不存在')
+        try: validate_dependencies(tasks+request.tasks)
+        except ValueError as e: fail(e)
+        for event in request.events:
+            event.id=uid(); event.source='ai'
+            if event.exceptions: fail('创建日程不能提供单次例外')
+        validate_event_changes(db,request.events)
+        for task in request.tasks: db.add(TaskRow(id=task.id,data=task.model_dump(mode='json')))
+        for event in request.events: db.add(EventRow(id=event.id,data=event.model_dump(mode='json')))
+        bump(db,state)
+        return {'tasks':request.tasks,'events':request.events}
 
 @app.post('/api/demo')
 def seed_demo():
